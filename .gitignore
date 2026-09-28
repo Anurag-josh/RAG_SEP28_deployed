@@ -1,0 +1,15 @@
+.env
+.venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+logs/
+.chroma_temp/
+cache/*.db
+cache/*.db-*
+cache/sessions.json
+cache/*.json.migrated
+test_out*.txt
+test_results.log
+/PHOTO-2026-07-20-13-37-20.jpg
+.DS_Store

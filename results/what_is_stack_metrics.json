@@ -1,0 +1,62 @@
+{
+  "timings": {
+    "Query Optimization": 0.5708806660040864,
+    "Phase 1 (Search)": 4.0067077499988955,
+    "Phase 2 (Filtering)": 1.0929814170012833,
+    "Phase 3 (Loading)": 0.763240374995803,
+    "Phase 4 (Chunking)": 0.006010999997670297,
+    "Phase 5 (Embedding)": 0.7230738750004093,
+    "Phase 6 (Vector Store)": 0.5636052089976147,
+    "Phase 7 (Retrieval)": 0.6788940419937717,
+    "Phase 8 (Prompt Build)": 9.458300337428227e-05,
+    "Phase 9 (Generation)": 1.2653835000019171,
+    "Total Pipeline Time": 17.511827959002403
+  },
+  "statistics": {
+    "Total Duration": "17.512s",
+    "Raw Search Matches": 3,
+    "Scraped Pages": 3,
+    "Total Chunks": 40,
+    "Retrieved Chunks": 5,
+    "Response Length (chars)": 1741,
+    "Fallback Mode": "Inactive (grounded response)"
+  },
+  "evaluation_metrics": {
+    "faithfulness_groundedness": {
+      "total_claims": 28,
+      "grounded_claims": 10,
+      "unsupported_claims": 18,
+      "contradicted_claims": 0,
+      "groundedness_percent": 35.71,
+      "error": null
+    },
+    "citation_quality": {
+      "sentences_with_citation": 6,
+      "sentences_without_citation": 22,
+      "citation_precision_percent": 100.0,
+      "citation_coverage_percent": 21.43,
+      "error": null
+    },
+    "retrieval_precision_recall": {
+      "precision_at_k": 0.8,
+      "recall_at_k": 0.19,
+      "k": 5,
+      "avg_similarity": 0.6316,
+      "highest_similarity": 0.6611,
+      "lowest_similarity": 0.6001,
+      "error": null
+    },
+    "hallucination": {
+      "hallucination_rate_percent": 64.29,
+      "hallucination_risk": "HIGH"
+    },
+    "answer_quality": {
+      "accuracy_score": 5.0,
+      "completeness_score": 5.0,
+      "clarity_score": 5.0,
+      "relevance_score": 5.0,
+      "answer_quality_overall": 5.0,
+      "error": null
+    }
+  }
+}
