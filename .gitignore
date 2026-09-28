@@ -9,6 +9,7 @@ cache/*.db
 cache/*.db-*
 cache/sessions.json
 cache/*.json.migrated
+uploads/*
 test_out*.txt
 test_results.log
 /PHOTO-2026-07-20-13-37-20.jpg
