@@ -5,10 +5,10 @@ import uuid
 import atexit
 import sys
 import logging
+import threading
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 
-from phase10.web_grounded_rag import WebGroundedRAGPipeline
 from config.config import validate_config
 from utils.document_loader import extract_text_from_file
 from utils.auth import hash_password, verify_password, create_jwt_token, decode_jwt_token
@@ -17,6 +17,10 @@ from utils.auth import hash_password, verify_password, create_jwt_token, decode_
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sourceiq_flask_app")
+print("[STARTUP] app.py imported", flush=True)
+
+pipeline = None
+_pipeline_lock = threading.Lock()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
@@ -27,18 +31,31 @@ os.makedirs(os.path.dirname(CHATS_FILE), exist_ok=True)
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"), static_folder=os.path.join(BASE_DIR, "static"))
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32MB max upload
+print("[STARTUP] Flask app created", flush=True)
 
-# Global RAG pipeline instance
-try:
-    validate_config()
-    pipeline = WebGroundedRAGPipeline()
-    if "--clear-cache" in sys.argv:
-        pipeline.cache_manager.clear_all_cache()
-        logger.info("Persistent RAG cache cleared at startup.")
-    logger.info("WebGroundedRAGPipeline successfully initialized.")
-except Exception as e:
-    logger.error(f"Failed to initialize RAG Pipeline: {e}")
-    pipeline = None
+def get_pipeline():
+    """Initializes the heavy RAG pipeline once, on the first dependent request."""
+    global pipeline
+    if pipeline is not None:
+        return pipeline
+
+    with _pipeline_lock:
+        if pipeline is not None:
+            return pipeline
+        try:
+            validate_config()
+            logger.info("[STARTUP] Importing RAG pipeline dependencies on demand.")
+            from phase10.web_grounded_rag import WebGroundedRAGPipeline
+
+            logger.info("[STARTUP] Initializing RAG pipeline on demand.")
+            pipeline = WebGroundedRAGPipeline()
+            if "--clear-cache" in sys.argv:
+                pipeline.cache_manager.clear_all_cache()
+                logger.info("Persistent RAG cache cleared at startup.")
+            logger.info("WebGroundedRAGPipeline successfully initialized.")
+        except Exception:
+            logger.exception("Failed to initialize RAG Pipeline")
+    return pipeline
 
 
 @atexit.register
@@ -99,7 +116,8 @@ def index():
 
 @app.route("/api/auth/register", methods=["POST"])
 def auth_register():
-    if not pipeline:
+    pipeline_instance = get_pipeline()
+    if not pipeline_instance:
         return jsonify({"success": False, "error": "System uninitialized"}), 500
     data = request.get_json() or {}
     username = data.get("username", "").strip()
@@ -109,7 +127,7 @@ def auth_register():
     if not username or not email or not password:
         return jsonify({"success": False, "error": "Username, email, and password are required."}), 400
 
-    mongo = pipeline.cache_manager.mongo
+    mongo = pipeline_instance.cache_manager.mongo
     if not mongo.available:
         return jsonify({"success": False, "error": "Database service unavailable. Please try again later."}), 503
 
@@ -135,7 +153,8 @@ def auth_register():
 
 @app.route("/api/auth/login", methods=["POST"])
 def auth_login():
-    if not pipeline:
+    pipeline_instance = get_pipeline()
+    if not pipeline_instance:
         return jsonify({"success": False, "error": "System uninitialized"}), 500
     data = request.get_json() or {}
     identifier = data.get("email", "").strip() or data.get("username", "").strip()
@@ -144,7 +163,7 @@ def auth_login():
     if not identifier or not password:
         return jsonify({"success": False, "error": "Email/username and password are required."}), 400
 
-    mongo = pipeline.cache_manager.mongo
+    mongo = pipeline_instance.cache_manager.mongo
     if not mongo.available:
         return jsonify({"success": False, "error": "Database service unavailable. Please try again later."}), 503
 
@@ -173,16 +192,18 @@ def auth_me():
 
 @app.route("/api/history", methods=["GET"])
 def get_history():
-    if not pipeline:
+    pipeline_instance = get_pipeline()
+    if not pipeline_instance:
         return jsonify({"success": False, "error": "System uninitialized"}), 500
     user_info = get_current_user_info()
     user_id = user_info["user_id"] if user_info else "anonymous"
-    history = pipeline.cache_manager.mongo.get_user_history(user_id)
+    history = pipeline_instance.cache_manager.mongo.get_user_history(user_id)
     return jsonify({"success": True, "history": history})
 
 @app.route("/api/history/<history_id>", methods=["GET", "DELETE"])
 def history_item_detail(history_id):
-    if not pipeline:
+    pipeline_instance = get_pipeline()
+    if not pipeline_instance:
         return jsonify({"success": False, "error": "System uninitialized"}), 500
     user_info = get_current_user_info()
     if not user_info:
@@ -190,10 +211,10 @@ def history_item_detail(history_id):
     user_id = user_info["user_id"]
 
     if request.method == "DELETE":
-        deleted = pipeline.cache_manager.mongo.delete_user_history_item(user_id, history_id)
+        deleted = pipeline_instance.cache_manager.mongo.delete_user_history_item(user_id, history_id)
         return jsonify({"success": deleted})
     else:
-        item = pipeline.cache_manager.mongo.get_user_history_item(user_id, history_id)
+        item = pipeline_instance.cache_manager.mongo.get_user_history_item(user_id, history_id)
         if item:
             return jsonify({"success": True, "history_item": item})
         return jsonify({"success": False, "error": "History item not found"}), 404
@@ -234,7 +255,8 @@ def upload_file():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    if not pipeline:
+    pipeline_instance = get_pipeline()
+    if not pipeline_instance:
         return jsonify({"success": False, "error": "RAG Pipeline not initialized. Check configuration and Groq API key."}), 500
         
     data = request.get_json() or {}
@@ -269,7 +291,7 @@ def chat():
     augmented_query = context_prefix + message if context_prefix else message
 
     try:
-        result = pipeline.run_pipeline(augmented_query, user_id=user_id, chat_id=chat_id, research_depth=research_depth)
+        result = pipeline_instance.run_pipeline(augmented_query, user_id=user_id, chat_id=chat_id, research_depth=research_depth)
 
         if result.get("success"):
             # Format sources nicely for SourceIQ UI
@@ -392,12 +414,13 @@ def chat_detail(chat_id):
 
 @app.route("/api/clear", methods=["POST"])
 def clear():
-    if not pipeline:
+    pipeline_instance = get_pipeline()
+    if not pipeline_instance:
         return jsonify({"success": False, "error": "Pipeline not initialized"}), 500
     try:
-        pipeline.chat_history.clear()
+        pipeline_instance.chat_history.clear()
         uploaded_documents.clear()
-        pipeline.cache_manager.clear_all_cache()
+        pipeline_instance.cache_manager.clear_all_cache()
         logger.info("Conversational chat history & uploaded files cleared.")
         return jsonify({"success": True})
     except Exception as e:

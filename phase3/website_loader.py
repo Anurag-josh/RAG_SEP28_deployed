@@ -15,7 +15,6 @@ from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 import requests
 import trafilatura
-from docling.document_converter import DocumentConverter
 
 # Package imports
 from config.config import BASE_DIR, MAX_CONCURRENT_REQUESTS

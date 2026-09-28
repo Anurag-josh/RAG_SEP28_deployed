@@ -84,7 +84,7 @@ class MongoStore:
             self._client.admin.command("ping")
             self._db = self._client[self.db_name]
             self._available = True
-            logger.info(f"MongoDB connected successfully to '{self.db_name}' at {self.uri}")
+            logger.info(f"MongoDB connected successfully to '{self.db_name}'.")
             self._init_indexes()
         except Exception as e:
             logger.warning(f"MongoDB connection failed ({e}). Running with local SQLite database store.")
