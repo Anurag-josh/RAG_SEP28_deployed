@@ -9,8 +9,10 @@ Dependencies: tavily, config.config, config.trusted_sources, utils.logger, utils
 import sys
 import time
 from typing import List, Dict, Any
-from tavily import TavilyClient
-from groq import Groq
+from utils.import_timing import timed_import
+
+TavilyClient = timed_import("tavily").TavilyClient
+Groq = timed_import("groq").Groq
 # Package imports
 from config.config import TAVILY_API_KEY, GROQ_API_KEY, GROQ_MODEL_NAME, MAX_SEARCH_RESULTS, validate_config
 from utils.logger import setup_logger

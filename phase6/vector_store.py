@@ -8,8 +8,10 @@ Dependencies: chromadb, utils.logger, utils.helper
 
 import sys
 from typing import List, Dict, Any, Optional
-import chromadb
-from chromadb.api.models.Collection import Collection
+from utils.import_timing import timed_import
+
+chromadb = timed_import("chromadb")
+Collection = timed_import("chromadb.api.models.Collection").Collection
 
 # Package imports
 from utils.logger import setup_logger

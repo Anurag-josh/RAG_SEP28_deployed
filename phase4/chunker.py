@@ -8,7 +8,9 @@ Dependencies: langchain_text_splitters, utils.logger, utils.helper
 
 import sys
 from typing import List, Dict, Any
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from utils.import_timing import timed_import
+
+RecursiveCharacterTextSplitter = timed_import("langchain_text_splitters").RecursiveCharacterTextSplitter
 
 # Package imports
 from config.config import CHUNK_SIZE, CHUNK_OVERLAP

@@ -10,7 +10,9 @@ import sys
 import time
 import os
 from typing import List, Dict, Any
-from google import genai
+from utils.import_timing import timed_import
+
+genai = timed_import("google.genai")
 
 # Package imports
 from config.config import GEMINI_API_KEY
@@ -70,10 +72,17 @@ class ChunkEmbedder:
             logger.info("[RAG-TIME] Hugging Face MiniLM model cache: %s", cache_state)
             print_loading(f"Initializing local SentenceTransformer ('{self.model_name}') model...")
             try:
-                from sentence_transformers import SentenceTransformer
+                torch_module = timed_import("torch")
+                timed_import("transformers")
+                sentence_transformers_module = timed_import("sentence_transformers")
+                SentenceTransformer = sentence_transformers_module.SentenceTransformer
+                logger.info("[RAG-TIME] PyTorch CUDA available: %s", torch_module.cuda.is_available())
+                model_load_started = time.perf_counter()
+                logger.info("[RAG-TIME] MiniLM model load START")
                 self.local_model = SentenceTransformer(self.model_name)
                 _LOCAL_MODEL_CACHE[self.model_name] = self.local_model
                 logger.info(f"Local SentenceTransformer model ('{self.model_name}') loaded successfully.")
+                logger.info("[RAG-TIME] MiniLM model load END: %.3f sec", time.perf_counter() - model_load_started)
             except Exception as e:
                 logger.warning("Could not load local SentenceTransformer (%s). Trying Gemini API fallback...", type(e).__name__)
                 if self.api_key:

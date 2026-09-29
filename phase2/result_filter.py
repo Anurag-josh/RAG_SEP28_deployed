@@ -9,7 +9,9 @@ Dependencies: urllib.parse, requests, config.trusted_sources, utils.logger, util
 import sys
 from typing import List, Dict, Any, Set
 from urllib.parse import urlparse, urlunparse
-import requests
+from utils.import_timing import timed_import
+
+requests = timed_import("requests")
 
 # Package imports
 from config.trusted_sources import is_domain_trusted, get_source_metadata

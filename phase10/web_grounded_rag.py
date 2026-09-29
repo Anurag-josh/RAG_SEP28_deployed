@@ -30,11 +30,14 @@ from config.config import (
     RESEARCH_DEPTH_CONFIG,
     RESEARCH_DEPTH_LEVELS
 )
-from cache.cache_manager import CacheManager
-from cache.intent_classifier import classify_query
-from cache.query_normalizer import normalize_and_hash
-from config.trusted_sources import is_domain_trusted
-from utils.logger import setup_logger
+from utils.import_timing import timed_import
+
+CacheManager = timed_import("cache.cache_manager").CacheManager
+classify_query = timed_import("cache.intent_classifier").classify_query
+normalize_and_hash = timed_import("cache.query_normalizer").normalize_and_hash
+is_domain_trusted = timed_import("config.trusted_sources").is_domain_trusted
+setup_logger = timed_import("utils.logger").setup_logger
+timed_import("utils.helper")
 from utils.helper import (
     print_phase_header,
     print_loading,
@@ -46,15 +49,15 @@ from utils.helper import (
 )
 
 # Phase Module Imports
-from phase1.web_search import WebSearcher
-from phase2.result_filter import ResultFilter
-from phase3.website_loader import WebsiteLoader
-from phase4.chunker import DocumentChunker
-from phase5.embedder import ChunkEmbedder
-from phase6.vector_store import VectorStoreManager
-from phase7.retriever import SemanticRetriever
-from phase8.prompt_builder import PromptBuilder
-from phase9.gemini_client import GeminiContentGenerator
+WebSearcher = timed_import("phase1.web_search").WebSearcher
+ResultFilter = timed_import("phase2.result_filter").ResultFilter
+WebsiteLoader = timed_import("phase3.website_loader").WebsiteLoader
+DocumentChunker = timed_import("phase4.chunker").DocumentChunker
+ChunkEmbedder = timed_import("phase5.embedder").ChunkEmbedder
+VectorStoreManager = timed_import("phase6.vector_store").VectorStoreManager
+SemanticRetriever = timed_import("phase7.retriever").SemanticRetriever
+PromptBuilder = timed_import("phase8.prompt_builder").PromptBuilder
+GeminiContentGenerator = timed_import("phase9.gemini_client").GeminiContentGenerator
 
 # Initialize logger
 logger = setup_logger("web_grounded_rag_app")

@@ -12,7 +12,9 @@ import sys
 import time
 import re
 from typing import Dict, Any, Tuple, Optional, List
-from groq import Groq
+from utils.import_timing import timed_import
+
+Groq = timed_import("groq").Groq
 
 # Package imports
 from config.config import (

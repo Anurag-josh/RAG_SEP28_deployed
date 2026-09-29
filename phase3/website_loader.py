@@ -16,8 +16,10 @@ import time
 import concurrent.futures
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
-import requests
-import trafilatura
+from utils.import_timing import timed_import
+
+requests = timed_import("requests")
+trafilatura = timed_import("trafilatura")
 
 # Package imports
 from config.config import BASE_DIR, MAX_CONCURRENT_REQUESTS
@@ -75,17 +77,23 @@ class WebsiteLoader:
         """Lazy-loads Docling DocumentConverter only when explicitly needed for PDF/documents."""
         if self.docling_available is None:
             started = time.perf_counter()
-            logger.info("[RAG-TIME] Docling initialization START")
+            logger.info("[RAG-IMPORT] docling.document_converter START")
             try:
-                from docling.document_converter import DocumentConverter
+                import_started = time.perf_counter()
+                try:
+                    from docling.document_converter import DocumentConverter
+                finally:
+                    logger.info("[RAG-IMPORT] docling.document_converter END: %.3f sec", time.perf_counter() - import_started)
+                converter_started = time.perf_counter()
                 self.converter = DocumentConverter()
+                logger.info("[RAG-TIME] Docling converter initialization: %.3f sec", time.perf_counter() - converter_started)
                 self.docling_available = True
             except Exception as e:
                 logger.warning("Docling converter not available (%s).", type(e).__name__)
                 self.docling_available = False
                 self.converter = None
             finally:
-                logger.info("[RAG-TIME] Docling initialization END: %.3f sec", time.perf_counter() - started)
+                logger.info("[RAG-TIME] Docling import and converter initialization: %.3f sec", time.perf_counter() - started)
         return self.converter
 
     def _download_bytes(self, url: str, total_timeout: float, max_bytes: int, stage: str) -> bytes:

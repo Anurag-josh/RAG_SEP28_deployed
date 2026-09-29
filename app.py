@@ -63,7 +63,16 @@ def get_pipeline():
             try:
                 validate_config()
                 logger.info("[STARTUP] Importing RAG pipeline dependencies on demand.")
-                from phase10.web_grounded_rag import WebGroundedRAGPipeline
+                from utils.import_timing import timed_import
+                torch_module = timed_import("torch")
+                logger.info(
+                    "[RAG-IMPORT] PyTorch build: version=%s CUDA available=%s CUDA version=%s",
+                    torch_module.__version__, torch_module.cuda.is_available(), torch_module.version.cuda
+                )
+                timed_import("transformers")
+                timed_import("sentence_transformers")
+                rag_module = timed_import("phase10.web_grounded_rag")
+                WebGroundedRAGPipeline = rag_module.WebGroundedRAGPipeline
 
                 logger.info("[STARTUP] Initializing RAG pipeline on demand.")
                 initialization_started = time.perf_counter()
