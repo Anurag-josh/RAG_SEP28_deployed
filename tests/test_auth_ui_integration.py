@@ -1,5 +1,6 @@
 import unittest
 import json
+from unittest.mock import patch
 from app import app, pipeline
 from utils.auth import create_jwt_token
 
@@ -30,6 +31,64 @@ class TestAuthUIIntegration(unittest.TestCase):
                         conn.execute("DELETE FROM query_history WHERE user_id IN (?, ?)", (self.test_user_a_id, self.test_user_b_id))
                 except Exception:
                     pass
+
+    def test_auth_flow_does_not_initialize_rag(self):
+        class FakeMongoStore:
+            available = True
+
+            def __init__(self):
+                self.users = {}
+
+            def get_user_by_email(self, email):
+                return next((user for user in self.users.values() if user["email"] == email.lower()), None)
+
+            def get_user_by_username(self, username):
+                return next((user for user in self.users.values() if user["username"] == username.lower()), None)
+
+            def create_user(self, user_id, username, email, password_hash):
+                user = {
+                    "user_id": user_id,
+                    "username": username.lower(),
+                    "email": email.lower(),
+                    "password_hash": password_hash
+                }
+                self.users[user_id] = user
+                return user
+
+        mongo = FakeMongoStore()
+        with patch("app.get_auth_mongo", return_value=mongo), \
+             patch("app.get_pipeline", side_effect=AssertionError("Auth initialized RAG")), \
+             patch("app.JWT_SECRET", "test-secret"), \
+             patch("app.hash_password", return_value="hashed-password"), \
+             patch("app.create_jwt_token", return_value="test-token"), \
+             patch("app.verify_password", return_value=True):
+            registration = self.app.post("/api/auth/register", json={
+                "username": "auth_test_user",
+                "email": "auth_test@example.com",
+                "password": "password123"
+            })
+            self.assertEqual(registration.status_code, 200)
+            self.assertTrue(registration.get_json()["success"])
+
+            duplicate = self.app.post("/api/auth/register", json={
+                "username": "another_name",
+                "email": "auth_test@example.com",
+                "password": "password123"
+            })
+            self.assertEqual(duplicate.status_code, 400)
+
+            login = self.app.post("/api/auth/login", json={
+                "email": "auth_test@example.com",
+                "password": "password123"
+            })
+            self.assertEqual(login.status_code, 200)
+            self.assertTrue(login.get_json()["success"])
+
+    def test_homepage_and_auth_routes_are_available(self):
+        self.assertEqual(self.app.get("/").status_code, 200)
+        rules = {rule.rule: rule.methods for rule in app.url_map.iter_rules()}
+        self.assertIn("POST", rules["/api/auth/register"])
+        self.assertIn("POST", rules["/api/auth/login"])
 
     def test_register_login_and_me_flow(self):
         if not (pipeline and pipeline.cache_manager and pipeline.cache_manager.mongo.available):

@@ -1739,6 +1739,34 @@
       if (switchRegLink) switchRegLink.addEventListener('click', (e) => { e.preventDefault(); switchToRegister(); });
       if (switchLoginLink) switchLoginLink.addEventListener('click', (e) => { e.preventDefault(); switchToLogin(); });
 
+      async function sendAuthRequest(endpoint, payload) {
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), 15000);
+        try {
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+          });
+          const responseText = await response.text();
+          let data = null;
+          try {
+            data = JSON.parse(responseText);
+          } catch (err) {
+            // Non-JSON responses are reported using their HTTP status below.
+          }
+          return { response, data };
+        } finally {
+          window.clearTimeout(timeoutId);
+        }
+      }
+
+      function authResponseError(action, response, data) {
+        const detail = data && typeof data.error === 'string' ? `: ${data.error}` : ': unexpected server response.';
+        return `${action} failed (HTTP ${response.status})${detail}`;
+      }
+
       loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const identifier = document.getElementById('loginIdentifier').value.trim();
@@ -1754,23 +1782,18 @@
         submitBtn.textContent = 'Signing in...';
 
         try {
-          const res = await fetch('/api/auth/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: identifier, username: identifier, password })
-          });
-          const data = await res.json();
-          if (data.success && data.token) {
+          const { response, data } = await sendAuthRequest('/api/auth/login', { email: identifier, username: identifier, password });
+          if (response.ok && data && data.success && data.token) {
             setToken(data.token);
             currentUser = data.user;
             updateProfileUI(currentUser);
             hideAuthModal();
             fetchUserHistory();
           } else {
-            showAuthError(data.error || 'Login failed. Check your credentials.');
+            showAuthError(authResponseError('Login', response, data));
           }
         } catch (err) {
-          showAuthError('Network error during login.');
+          showAuthError(err.name === 'AbortError' ? 'Login request timed out. Please try again.' : 'Network error during login. Please try again.');
         } finally {
           submitBtn.disabled = false;
           submitBtn.textContent = 'Sign In';
@@ -1804,23 +1827,18 @@
         submitBtn.textContent = 'Creating Account...';
 
         try {
-          const res = await fetch('/api/auth/register', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, email, password })
-          });
-          const data = await res.json();
-          if (data.success && data.token) {
+          const { response, data } = await sendAuthRequest('/api/auth/register', { username, email, password });
+          if (response.ok && data && data.success && data.token) {
             setToken(data.token);
             currentUser = data.user;
             updateProfileUI(currentUser);
             hideAuthModal();
             fetchUserHistory();
           } else {
-            showAuthError(data.error || 'Registration failed.');
+            showAuthError(authResponseError('Registration', response, data));
           }
         } catch (err) {
-          showAuthError('Network error during registration.');
+          showAuthError(err.name === 'AbortError' ? 'Registration request timed out. Please try again.' : 'Network error during registration. Please try again.');
         } finally {
           submitBtn.disabled = false;
           submitBtn.textContent = 'Create Account';

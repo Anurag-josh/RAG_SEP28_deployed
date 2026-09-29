@@ -73,11 +73,17 @@ class MongoStore:
             logger.warning("pymongo package not installed. Using local SQLite fallback store for DB operations.")
             return
 
+        if not self.uri:
+            logger.warning("MongoDB URI is not configured.")
+            return
+
         try:
             self._client = MongoClient(
                 self.uri,
                 serverSelectionTimeoutMS=2000,
                 connectTimeoutMS=2000,
+                socketTimeoutMS=5000,
+                waitQueueTimeoutMS=5000,
                 maxPoolSize=20
             )
             # Test connection
@@ -87,7 +93,7 @@ class MongoStore:
             logger.info(f"MongoDB connected successfully to '{self.db_name}'.")
             self._init_indexes()
         except Exception as e:
-            logger.warning(f"MongoDB connection failed ({e}). Running with local SQLite database store.")
+            logger.warning("MongoDB connection failed (%s). Running with local SQLite database store.", type(e).__name__)
             self._available = False
 
     def set_fallback_store(self, fallback_store: Any) -> None:
@@ -120,7 +126,7 @@ class MongoStore:
             self._db.reusable_answers.create_index([("expires_at", ASCENDING)])
             logger.debug("MongoDB indexes initialized successfully.")
         except Exception as e:
-            logger.warning(f"MongoDB index creation warning: {e}")
+            logger.warning("MongoDB index creation warning (%s).", type(e).__name__)
 
     # ── User Management ─────────────────────────────────────────────────────────
 
@@ -145,10 +151,10 @@ class MongoStore:
                 logger.info(f"[Mongo] User registered: {username} ({email})")
                 return doc
             except pymongo.errors.DuplicateKeyError as e:
-                logger.warning(f"[Mongo] Create user duplicate key: {e}")
+                logger.warning("[Mongo] Create user duplicate key (%s).", type(e).__name__)
                 return None
             except Exception as e:
-                logger.error(f"[Mongo] create_user error: {e}")
+                logger.error("[Mongo] create_user failed (%s).", type(e).__name__)
 
         fallback = getattr(self, 'fallback_store', None)
         if fallback:
@@ -162,7 +168,7 @@ class MongoStore:
                 if user:
                     return user
             except Exception as e:
-                logger.warning(f"[Mongo] get_user_by_email error: {e}")
+                logger.warning("[Mongo] get_user_by_email failed (%s).", type(e).__name__)
 
         fallback = getattr(self, 'fallback_store', None)
         if fallback:
@@ -176,7 +182,7 @@ class MongoStore:
                 if user:
                     return user
             except Exception as e:
-                logger.warning(f"[Mongo] get_user_by_username error: {e}")
+                logger.warning("[Mongo] get_user_by_username failed (%s).", type(e).__name__)
 
         fallback = getattr(self, 'fallback_store', None)
         if fallback:

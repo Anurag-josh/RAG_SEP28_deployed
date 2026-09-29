@@ -9,7 +9,7 @@ import threading
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 
-from config.config import validate_config
+from config.config import JWT_SECRET, MONGODB_DATABASE, MONGODB_URI, validate_config
 from utils.document_loader import extract_text_from_file
 from utils.auth import hash_password, verify_password, create_jwt_token, decode_jwt_token
 
@@ -21,6 +21,8 @@ print("[STARTUP] app.py imported", flush=True)
 
 pipeline = None
 _pipeline_lock = threading.Lock()
+auth_mongo = None
+_auth_mongo_lock = threading.Lock()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
@@ -58,6 +60,30 @@ def get_pipeline():
     return pipeline
 
 
+def get_auth_mongo():
+    """Returns the auth-only MongoDB store without initializing the RAG pipeline."""
+    global auth_mongo
+    if auth_mongo is not None:
+        return auth_mongo
+
+    with _auth_mongo_lock:
+        if auth_mongo is not None:
+            return auth_mongo
+
+        logger.info(
+            "[AUTH] MongoDB configuration present: %s",
+            "YES" if MONGODB_URI and MONGODB_DATABASE else "NO"
+        )
+        if not MONGODB_URI or not MONGODB_DATABASE:
+            return None
+
+        from cache.mongo_store import MongoStore
+
+        auth_mongo = MongoStore()
+        logger.info("[AUTH] MongoDB connection %s", "successful" if auth_mongo.available else "unavailable")
+        return auth_mongo
+
+
 @atexit.register
 def close_pipeline_cache():
     """Close the application-scoped cache connections during process shutdown."""
@@ -66,6 +92,11 @@ def close_pipeline_cache():
             pipeline.cache_manager.close()
         except Exception as e:
             logger.warning(f"Failed to close cache manager: {e}")
+    if auth_mongo:
+        try:
+            auth_mongo.close()
+        except Exception as e:
+            logger.warning("Failed to close auth MongoDB client (%s).", type(e).__name__)
 
 # Storage for uploaded files in session
 uploaded_documents = {}  # file_id -> { filename, text, chunk_count }
@@ -116,70 +147,99 @@ def index():
 
 @app.route("/api/auth/register", methods=["POST"])
 def auth_register():
-    pipeline_instance = get_pipeline()
-    if not pipeline_instance:
-        return jsonify({"success": False, "error": "System uninitialized"}), 500
-    data = request.get_json() or {}
-    username = data.get("username", "").strip()
-    email = data.get("email", "").strip()
-    password = data.get("password", "").strip()
+    logger.info("[AUTH] Registration request received")
+    try:
+        logger.info("[AUTH] Validating registration request")
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"success": False, "error": "A JSON request body is required."}), 400
 
-    if not username or not email or not password:
-        return jsonify({"success": False, "error": "Username, email, and password are required."}), 400
+        username = data.get("username", "")
+        email = data.get("email", "")
+        password = data.get("password", "")
+        if not all(isinstance(value, str) for value in (username, email, password)):
+            return jsonify({"success": False, "error": "Username, email, and password must be text."}), 400
+        username, email, password = username.strip(), email.strip(), password.strip()
+        if not username or not email or not password:
+            return jsonify({"success": False, "error": "Username, email, and password are required."}), 400
+        if not JWT_SECRET:
+            logger.error("[AUTH] JWT secret is not configured")
+            return jsonify({"success": False, "error": "Authentication service is not configured."}), 503
 
-    mongo = pipeline_instance.cache_manager.mongo
-    if not mongo.available:
-        return jsonify({"success": False, "error": "Database service unavailable. Please try again later."}), 503
+        logger.info("[AUTH] Checking MongoDB connection")
+        mongo = get_auth_mongo()
+        if not mongo or not mongo.available:
+            logger.warning("[AUTH] MongoDB is unavailable for registration")
+            return jsonify({"success": False, "error": "Database service unavailable. Please try again later."}), 503
 
-    # Check for existing email or username explicitly
-    if mongo.get_user_by_email(email):
-        return jsonify({"success": False, "error": "An account with this email address already exists. Please sign in."}), 400
+        logger.info("[AUTH] Checking existing user")
+        if mongo.get_user_by_email(email):
+            return jsonify({"success": False, "error": "An account with this email address already exists. Please sign in."}), 400
+        if mongo.get_user_by_username(username):
+            return jsonify({"success": False, "error": "This username is already taken. Please choose a different username."}), 400
 
-    if mongo.get_user_by_username(username):
-        return jsonify({"success": False, "error": "This username is already taken. Please choose a different username."}), 400
+        logger.info("[AUTH] Creating user")
+        hashed = hash_password(password)
+        user_id = f"usr_{uuid.uuid4().hex[:12]}"
+        created = mongo.create_user(user_id, username, email, hashed)
+        if not created:
+            logger.error("[AUTH] User insertion failed")
+            return jsonify({"success": False, "error": "Failed to create user account. Please try again."}), 503
 
-    hashed = hash_password(password)
-    user_id = f"usr_{uuid.uuid4().hex[:12]}"
-    created = mongo.create_user(user_id, username, email, hashed)
-    if not created:
-        return jsonify({"success": False, "error": "Failed to create user account. Please try again."}), 500
-
-    token = create_jwt_token(user_id, username, email)
-    return jsonify({
-        "success": True,
-        "token": token,
-        "user": {"user_id": user_id, "username": username, "email": email}
-    })
+        logger.info("[AUTH] User created; generating JWT")
+        token = create_jwt_token(user_id, username, email)
+        logger.info("[AUTH] Sending registration response")
+        return jsonify({
+            "success": True,
+            "token": token,
+            "user": {"user_id": user_id, "username": username, "email": email}
+        })
+    except Exception as e:
+        logger.error("[AUTH] Registration failed (%s)", type(e).__name__)
+        return jsonify({"success": False, "error": "Registration failed. Please try again."}), 500
 
 @app.route("/api/auth/login", methods=["POST"])
 def auth_login():
-    pipeline_instance = get_pipeline()
-    if not pipeline_instance:
-        return jsonify({"success": False, "error": "System uninitialized"}), 500
-    data = request.get_json() or {}
-    identifier = data.get("email", "").strip() or data.get("username", "").strip()
-    password = data.get("password", "").strip()
+    logger.info("[AUTH] Login request received")
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"success": False, "error": "A JSON request body is required."}), 400
+        email = data.get("email", "")
+        username = data.get("username", "")
+        password = data.get("password", "")
+        if not all(isinstance(value, str) for value in (email, username, password)):
+            return jsonify({"success": False, "error": "Email/username and password must be text."}), 400
+        identifier = email.strip() or username.strip()
+        password = password.strip()
+        if not identifier or not password:
+            return jsonify({"success": False, "error": "Email/username and password are required."}), 400
+        if not JWT_SECRET:
+            logger.error("[AUTH] JWT secret is not configured")
+            return jsonify({"success": False, "error": "Authentication service is not configured."}), 503
 
-    if not identifier or not password:
-        return jsonify({"success": False, "error": "Email/username and password are required."}), 400
+        logger.info("[AUTH] Checking MongoDB connection")
+        mongo = get_auth_mongo()
+        if not mongo or not mongo.available:
+            logger.warning("[AUTH] MongoDB is unavailable for login")
+            return jsonify({"success": False, "error": "Database service unavailable. Please try again later."}), 503
 
-    mongo = pipeline_instance.cache_manager.mongo
-    if not mongo.available:
-        return jsonify({"success": False, "error": "Database service unavailable. Please try again later."}), 503
+        user = mongo.get_user_by_email(identifier) or mongo.get_user_by_username(identifier)
+        if not user:
+            return jsonify({"success": False, "error": "No account found with this email/username. Click 'Create Account' to register."}), 404
+        if not verify_password(password, user.get("password_hash", "")):
+            return jsonify({"success": False, "error": "Incorrect password. Please try again."}), 401
 
-    user = mongo.get_user_by_email(identifier) or mongo.get_user_by_username(identifier)
-    if not user:
-        return jsonify({"success": False, "error": "No account found with this email/username. Click 'Create Account' to register."}), 404
-
-    if not verify_password(password, user.get("password_hash", "")):
-        return jsonify({"success": False, "error": "Incorrect password. Please try again."}), 401
-
-    token = create_jwt_token(user["user_id"], user["username"], user["email"])
-    return jsonify({
-        "success": True,
-        "token": token,
-        "user": {"user_id": user["user_id"], "username": user["username"], "email": user["email"]}
-    })
+        token = create_jwt_token(user["user_id"], user["username"], user["email"])
+        logger.info("[AUTH] Sending login response")
+        return jsonify({
+            "success": True,
+            "token": token,
+            "user": {"user_id": user["user_id"], "username": user["username"], "email": user["email"]}
+        })
+    except Exception as e:
+        logger.error("[AUTH] Login failed (%s)", type(e).__name__)
+        return jsonify({"success": False, "error": "Login failed. Please try again."}), 500
 
 @app.route("/api/auth/me", methods=["GET"])
 def auth_me():

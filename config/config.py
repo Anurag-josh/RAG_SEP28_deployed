@@ -77,9 +77,9 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
 REDIS_POOL_MAX_CONNECTIONS = int(os.getenv("REDIS_POOL_MAX_CONNECTIONS", "10"))
 
 # MongoDB connection (L2 persistent user & query store)
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017").strip()
-MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "sourceiq_rag").strip()
-JWT_SECRET = os.getenv("JWT_SECRET", "super_secret_jwt_key_sourceiq_2026").strip()
+MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "").strip()
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
 
 # SQLite persistent cache database
 _cache_db_path = Path(
