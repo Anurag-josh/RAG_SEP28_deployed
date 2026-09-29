@@ -12,6 +12,7 @@ import time
 import os
 import re
 import json
+from functools import wraps
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -57,6 +58,24 @@ from phase9.gemini_client import GeminiContentGenerator
 
 # Initialize logger
 logger = setup_logger("web_grounded_rag_app")
+
+def _log_rag_time(stage: str, started: float) -> float:
+    elapsed = time.perf_counter() - started
+    logger.info("[RAG-TIME] %s: %.3f sec", stage, elapsed)
+    return elapsed
+
+
+def _time_pipeline_run(method):
+    @wraps(method)
+    def timed_run(*args, **kwargs):
+        started = time.perf_counter()
+        logger.info("[RAG-TIME] pipeline start")
+        try:
+            return method(*args, **kwargs)
+        finally:
+            _log_rag_time("total", started)
+    return timed_run
+
 
 def deduplicate_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -112,6 +131,7 @@ class WebGroundedRAGPipeline:
         self.chat_history: List[Dict[str, str]] = []
         logger.info("Pipeline components pre-warmed and ready.")
 
+    @_time_pipeline_run
     def run_pipeline(
         self,
         query: str,
@@ -155,6 +175,7 @@ class WebGroundedRAGPipeline:
         total_start = time.perf_counter()
 
         # Load chat context scoped strictly by (user_id, chat_id)
+        context_started = time.perf_counter()
         if chat_history is not None:
             active_history = chat_history
         elif clean_chat_id and user_id:
@@ -163,10 +184,13 @@ class WebGroundedRAGPipeline:
             active_history = []
 
         logger.info(f"[CONTEXT] Loaded {len(active_history)} messages for user_id={user_id} chat_id={clean_chat_id}")
+        _log_rag_time("conversation context lookup", context_started)
 
         # Context Resolution BEFORE Cache Lookup
         from cache.context_resolver import resolve_context_query
+        context_resolution_started = time.perf_counter()
         res_status, resolved_query = resolve_context_query(query, active_history)
+        _log_rag_time("context resolution", context_resolution_started)
 
         if res_status == "AMBIGUOUS":
             logger.warning(f"[CONTEXT] Unable to resolve reference for query: '{query}'")
@@ -234,12 +258,14 @@ class WebGroundedRAGPipeline:
                 lookup_start = time.perf_counter()
                 exact = self.cache_manager.get_exact(query_hash)
                 cache_timings["exact_cache_lookup_ms"] = (time.perf_counter() - lookup_start) * 1000
+                _log_rag_time("exact cache lookup (Redis)", lookup_start)
                 if exact:
                     cached_d = exact.get("research_depth", "quick")
                     logger.info(f"[RESEARCH CACHE] Cached depth={cached_d}")
                     logger.info(f"[RESEARCH CACHE] Requested depth={clean_depth}")
                     if is_depth_sufficient(cached_d, clean_depth):
                         logger.info("[RESEARCH CACHE] SUFFICIENT")
+                        logger.info("[RAG-TIME] cache mode: Redis exact hit")
                         exact["cache_mode"] = "REDIS_HIT"
                         exact["research_depth"] = clean_depth
                         exact.setdefault("timings", {})["total_request_ms"] = (time.perf_counter() - total_start) * 1000
@@ -259,12 +285,14 @@ class WebGroundedRAGPipeline:
                 mongo_start = time.perf_counter()
                 mongo_hit = self.cache_manager.get_mongo_answer(query_hash)
                 cache_timings["mongo_cache_lookup_ms"] = (time.perf_counter() - mongo_start) * 1000
+                _log_rag_time("reusable-answer lookup (MongoDB)", mongo_start)
                 if mongo_hit:
                     cached_d = mongo_hit.get("research_depth", "quick")
                     logger.info(f"[RESEARCH CACHE] Cached depth={cached_d}")
                     logger.info(f"[RESEARCH CACHE] Requested depth={clean_depth}")
                     if is_depth_sufficient(cached_d, clean_depth):
                         logger.info("[RESEARCH CACHE] SUFFICIENT")
+                        logger.info("[RAG-TIME] cache mode: MongoDB reusable-answer hit")
                         mongo_hit["cache_mode"] = "MONGODB_HIT"
                         mongo_hit["research_depth"] = clean_depth
                         mongo_hit.setdefault("timings", {})["total_request_ms"] = (time.perf_counter() - total_start) * 1000
@@ -281,18 +309,23 @@ class WebGroundedRAGPipeline:
                         logger.info("[RESEARCH CACHE] INSUFFICIENT")
 
                 # ── Tier 3: L3 SQLite Semantic Cache & Knowledge Reuse ───────────
+                semantic_lookup_start = time.perf_counter()
                 query_embedding = self.cache_manager.get_query_embedding(query_hash)
                 if query_embedding is None:
+                    embedding_started = time.perf_counter()
                     query_embedding = self.embedder.embed_texts([normalized_query])[0]
+                    _log_rag_time("query embedding", embedding_started)
                     self.cache_manager.set_query_embedding(query_hash, query_embedding)
 
                 decision = self.cache_manager.decide_semantic(effective_query, normalized_query, query_embedding)
+                _log_rag_time("semantic cache lookup (SQLite)", semantic_lookup_start)
                 if decision.type == "ANSWER_HIT":
                     cached_d = getattr(decision, "research_depth", "quick")
                     logger.info(f"[RESEARCH CACHE] Cached depth={cached_d}")
                     logger.info(f"[RESEARCH CACHE] Requested depth={clean_depth}")
                     if is_depth_sufficient(cached_d, clean_depth):
                         logger.info("[RESEARCH CACHE] SUFFICIENT")
+                        logger.info("[RAG-TIME] cache mode: SQLite semantic answer hit")
                         hit_resp = self._build_cache_hit_response(decision, cache_timings, total_start)
                         hit_resp["cache_mode"] = "SEMANTIC_HIT"
                         hit_resp["research_depth"] = clean_depth
@@ -316,6 +349,7 @@ class WebGroundedRAGPipeline:
                         active_history, top_k, total_start, cache_timings
                     )
                     if reused is not None:
+                        logger.info("[RAG-TIME] cache mode: SQLite knowledge reuse")
                         reused["cache_mode"] = "KNOWLEDGE_REUSE"
                         reused["research_depth"] = clean_depth
                         reused["sources_analyzed"] = target_sources
@@ -331,7 +365,10 @@ class WebGroundedRAGPipeline:
                         return reused
             else:
                 logger.info(f"[Freshness] Real-time query detected ('{effective_query}'). Bypassing stale cache for fresh search.")
+                logger.info("[RAG-TIME] cache mode: bypassed for real-time query")
+                embedding_started = time.perf_counter()
                 query_embedding = self.embedder.embed_texts([normalized_query])[0]
+                _log_rag_time("query embedding", embedding_started)
         finally:
             if is_leader:
                 self.cache_manager.release_coalesce_lock(query_hash)
@@ -342,6 +379,7 @@ class WebGroundedRAGPipeline:
             f"intent='{classification.get('intent')}' | scope='{classification.get('scope')}' | "
             f"similarity=0.000 | cache source=None"
         )
+        logger.info("[RAG-TIME] cache mode: FULL RAG MISS")
 
         try:
             # 0. Configuration Validation
@@ -369,6 +407,7 @@ class WebGroundedRAGPipeline:
                 search_query = self.searcher.optimize_query(query)
                 print_success(f"Optimized search query: '{search_query}'")
             timings["Phase 0 (Query Optimization)"] = time.perf_counter() - start
+            _log_rag_time("query optimization", start)
 
             fallback_mode = False
             raw_search_results = []
@@ -383,6 +422,7 @@ class WebGroundedRAGPipeline:
                 t_search = time.perf_counter()
                 raw_search_results = self.searcher.search(search_query, max_results=max_search_results)
                 timings["Phase 1 (Web Search)"] = time.perf_counter() - t_search
+                _log_rag_time("Tavily search", t_search)
                 print_success(f"Discovered {len(raw_search_results)} candidate web sources.")
 
                 # ====================================================
@@ -392,6 +432,7 @@ class WebGroundedRAGPipeline:
                 t_filter = time.perf_counter()
                 filtered_results = self.filter_engine.filter_results(raw_search_results)
                 timings["Phase 2 (URL Filtering)"] = time.perf_counter() - t_filter
+                _log_rag_time("result filtering", t_filter)
                 print_success(f"Retained {len(filtered_results)} unique, valid URLs.")
 
                 if not filtered_results:
@@ -461,6 +502,7 @@ class WebGroundedRAGPipeline:
                     })
 
                 timings["Phase 3 (Website Loading)"] = time.perf_counter() - start
+                _log_rag_time("website loading", start)
 
                 successful_docs = [doc for doc in loaded_docs if doc.get("success", False)]
                 print_success(f"Successfully scraped and extracted {len(successful_docs)} of {len(urls_to_load)} web pages.")
@@ -555,6 +597,7 @@ class WebGroundedRAGPipeline:
             start = time.perf_counter()
             chunks = self.chunker.chunk_documents(successful_docs)
             timings["Phase 4 (Chunking)"] = time.perf_counter() - start
+            _log_rag_time("chunking", start)
             print_success(f"Split documents into {len(chunks)} text chunks.")
 
             if not chunks:
@@ -572,6 +615,7 @@ class WebGroundedRAGPipeline:
             start = time.perf_counter()
             embedded_chunks = self.embedder.embed_chunks(chunks)
             timings["Phase 5 (Embedding Generation)"] = time.perf_counter() - start
+            _log_rag_time("embedding", start)
             print_success(f"Generated vector representations for {len(embedded_chunks)} chunks.")
 
             # ====================================================
@@ -579,9 +623,15 @@ class WebGroundedRAGPipeline:
             # ====================================================
             print_phase_header("Phase 6: Vector Storage")
             start = time.perf_counter()
+            chroma_init_start = time.perf_counter()
             db_manager = VectorStoreManager()
+            _log_rag_time("Chroma initialization", chroma_init_start)
+            collection_started = time.perf_counter()
             col = db_manager.create_collection(temp_collection_name)
+            _log_rag_time("Chroma collection creation", collection_started)
+            chroma_ingest_start = time.perf_counter()
             db_manager.add_chunks(embedded_chunks)
+            _log_rag_time("Chroma ingestion", chroma_ingest_start)
             timings["Phase 6 (ChromaDB Storage)"] = time.perf_counter() - start
             print_success(f"Ingested vectors into ChromaDB in-memory collection '{temp_collection_name}'.")
 
@@ -594,6 +644,7 @@ class WebGroundedRAGPipeline:
             raw_retrieved_chunks = retriever.retrieve(search_query, top_k=top_k)
             retrieved_chunks = deduplicate_chunks(raw_retrieved_chunks)
             timings["Phase 7 (Retrieval)"] = time.perf_counter() - start
+            _log_rag_time("retrieval", start)
             print_success(f"Retrieved {len(raw_retrieved_chunks)} chunks -> {len(retrieved_chunks)} unique deduplicated chunks.")
             logger.info(f"[RESEARCH] retrieved_chunks={len(raw_retrieved_chunks)} unique_chunks={len(retrieved_chunks)}")
 
@@ -615,6 +666,7 @@ class WebGroundedRAGPipeline:
                 research_depth=clean_depth, existing_answer=existing_answer
             )
             timings["Phase 8 (Prompt Building)"] = time.perf_counter() - start
+            _log_rag_time("prompt construction", start)
             est_prompt_tokens = len(grounded_prompt) // 4
             logger.info(f"[GENERATION] depth={clean_depth} estimated_prompt_tokens=~{est_prompt_tokens} requested_output_tokens={max_output_tokens}")
             print_success("Structured grounded prompt constructed successfully.")
@@ -628,9 +680,11 @@ class WebGroundedRAGPipeline:
                 grounded_prompt, max_tokens=max_output_tokens
             )
             timings["Phase 9 (LLM Generation)"] = time.perf_counter() - start
+            _log_rag_time("Groq/Gemini generation", start)
             print_success("Grounded response generated.")
 
             # Parse inline citations from the generated answer
+            evaluation_started = time.perf_counter()
             cited_indices = set()
             for match in re.findall(r'\[(?:Source\s*)?(\d+)\]', answer):
                 try:
@@ -657,6 +711,7 @@ class WebGroundedRAGPipeline:
                     if url not in seen_cited_urls:
                         seen_cited_urls.add(url)
                         cited_sources.append({"title": chunk["title"], "url": url})
+            _log_rag_time("answer validation and citation processing (no separate evaluator configured)", evaluation_started)
 
             active_history.append({"role": "user", "content": query})
             active_history.append({"role": "assistant", "content": answer})
@@ -700,12 +755,16 @@ class WebGroundedRAGPipeline:
                 "token_usage": token_usage,
                 "error": None
             }
+            cache_persist_started = time.perf_counter()
             self._populate_cache(
                 query_hash, normalized_query, query, query_embedding, answer,
                 result, embedded_chunks, successful_docs, research_depth=clean_depth
             )
+            _log_rag_time("cache persistence", cache_persist_started)
             result["cache_mode"] = "RAG_MISS"
+            history_persist_started = time.perf_counter()
             self._record_user_history(user_id, query_hash, query, normalized_query, classification, result, "RAG_MISS", chat_id=chat_id, resolved_query=effective_query)
+            _log_rag_time("MongoDB history persistence", history_persist_started)
             return result
 
         except Exception as e:
@@ -756,6 +815,7 @@ class WebGroundedRAGPipeline:
             
             t_clean_elapsed = time.perf_counter() - t_clean_start
             timings["Phase 10 (Cleanup)"] = t_clean_elapsed
+            _log_rag_time("Chroma cleanup and garbage collection", t_clean_start)
             
             logger.info("Garbage collection triggered. Memory freed. System stateless.")
             print_success("All temporary memories deleted. System returned to empty state.")

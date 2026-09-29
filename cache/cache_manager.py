@@ -86,9 +86,15 @@ class CacheManager:
         logger.info("Initializing CacheManager with L1 Redis + L2 MongoDB + L3 SQLite...")
 
         # Initialize stores
+        store_started = time.perf_counter()
         self.sqlite = SQLiteStore(db_path=db_path)
+        logger.info("[RAG-TIME] SQLite initialization: %.3f sec", time.perf_counter() - store_started)
+        store_started = time.perf_counter()
         self.redis = RedisStore()
+        logger.info("[RAG-TIME] Redis initialization: %.3f sec", time.perf_counter() - store_started)
+        store_started = time.perf_counter()
         self.mongo = MongoStore(uri=mongo_uri, fallback_store=self.sqlite)
+        logger.info("[RAG-TIME] MongoDB initialization: %.3f sec", time.perf_counter() - store_started)
         self.semantic_cache = SemanticCache(self.redis, self.sqlite)
 
         # Stampede protection / request coalescing locks
@@ -102,7 +108,9 @@ class CacheManager:
         )
 
         # Migrate legacy JSON page cache if it exists
+        migration_started = time.perf_counter()
         self._migrate_legacy_cache()
+        logger.info("[RAG-TIME] legacy cache migration: %.3f sec", time.perf_counter() - migration_started)
 
 
     # ── Exact Cache ──────────────────────────────────────────────────────────
@@ -485,6 +493,7 @@ class CacheManager:
             intent, scope, requirements = "concept_explanation", "", {}
 
         # 2. Save pages + build chunk/embedding store
+        sqlite_persist_started = time.perf_counter()
         source_ids: List[int] = []
         all_chunk_ids: List[int] = []
 
@@ -535,6 +544,7 @@ class CacheManager:
                 logger.debug(f"[Cache] Query metadata saved (chunks={len(all_chunk_ids)})")
 
                 # 4. Register in Redis semantic index + store embedding
+                redis_semantic_started = time.perf_counter()
                 self.set_query_embedding(query_hash, query_embedding)
                 semantic_meta = {
                     "query_hash": query_hash,
@@ -549,6 +559,9 @@ class CacheManager:
                 }
                 self.redis.set_semantic_entry(query_hash, semantic_meta)
                 self.redis.add_to_semantic_index(query_hash)
+                logger.info("[RAG-TIME] Redis semantic cache persistence: %.3f sec", time.perf_counter() - redis_semantic_started)
+
+            logger.info("[RAG-TIME] SQLite content persistence: %.3f sec", time.perf_counter() - sqlite_persist_started)
 
         # 5. Set exact answer in Redis (L1)
         exact_payload = {
@@ -563,10 +576,13 @@ class CacheManager:
             "token_usage": pipeline_result.get("token_usage", {}),
             "error": None,
         }
+        redis_exact_started = time.perf_counter()
         self.set_exact(query_hash, exact_payload)
+        logger.info("[RAG-TIME] Redis exact-answer persistence: %.3f sec", time.perf_counter() - redis_exact_started)
 
         # 6. Save reusable answer in MongoDB (L2)
         ttl = get_ttl_for_query(normalized_query)
+        mongo_persist_started = time.perf_counter()
         self.mongo.save_reusable_answer(
             query_hash=query_hash,
             normalized_query=normalized_query,
@@ -581,6 +597,7 @@ class CacheManager:
             research_depth=research_depth,
             sources_analyzed=len(loaded_docs)
         )
+        logger.info("[RAG-TIME] MongoDB reusable-answer persistence: %.3f sec", time.perf_counter() - mongo_persist_started)
 
         elapsed = (time.perf_counter() - t0) * 1000
         logger.info(

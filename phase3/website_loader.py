@@ -9,7 +9,10 @@ Dependencies: requests, docling, trafilatura, utils.logger, utils.helper, cache.
 
 import sys
 import json
+import os
 import random
+import tempfile
+import time
 import concurrent.futures
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
@@ -62,6 +65,7 @@ class WebsiteLoader:
         self.converter = None
         self.docling_available = None
         self.request_timeout = 5.0
+        self.total_load_timeout = 45.0
         if self.cache_manager:
             logger.debug("WebsiteLoader: using SQLite page cache via CacheManager.")
         else:
@@ -70,43 +74,89 @@ class WebsiteLoader:
     def _get_docling_converter(self):
         """Lazy-loads Docling DocumentConverter only when explicitly needed for PDF/documents."""
         if self.docling_available is None:
+            started = time.perf_counter()
+            logger.info("[RAG-TIME] Docling initialization START")
             try:
                 from docling.document_converter import DocumentConverter
                 self.converter = DocumentConverter()
                 self.docling_available = True
             except Exception as e:
-                logger.warning(f"Docling converter not available: {e}")
+                logger.warning("Docling converter not available (%s).", type(e).__name__)
                 self.docling_available = False
                 self.converter = None
+            finally:
+                logger.info("[RAG-TIME] Docling initialization END: %.3f sec", time.perf_counter() - started)
         return self.converter
+
+    def _download_bytes(self, url: str, total_timeout: float, max_bytes: int, stage: str) -> bytes:
+        """Downloads a URL with connect/read and total-duration bounds."""
+        started = time.perf_counter()
+        deadline = started + total_timeout
+        hostname = urlparse(url).hostname or "unknown-host"
+        content = bytearray()
+        try:
+            with requests.get(
+                url,
+                headers={"User-Agent": random.choice(USER_AGENTS)},
+                timeout=(3.0, self.request_timeout),
+                stream=True
+            ) as response:
+                response.raise_for_status()
+                for block in response.iter_content(chunk_size=64 * 1024):
+                    if time.perf_counter() > deadline:
+                        raise TimeoutError(f"Download exceeded {total_timeout:.0f}-second limit")
+                    if block:
+                        content.extend(block)
+                        if len(content) > max_bytes:
+                            raise ValueError(f"Download exceeded {max_bytes} byte limit")
+            return bytes(content)
+        finally:
+            logger.info(
+                "[RAG-TIME] %s host=%s: %.3f sec",
+                stage, hostname, time.perf_counter() - started
+            )
 
     def load_with_docling(self, url: str) -> str:
         """Attempts to parse a PDF or document file directly using Docling."""
         converter = self._get_docling_converter()
         if not converter:
             raise RuntimeError("Docling is not available.")
-            
-        logger.info(f"Attempting Docling download/parse for document URL: {url}")
-        result = converter.convert(url)
-        markdown = result.document.export_to_markdown()
-        
-        if not markdown or not markdown.strip():
-            raise ValueError("Docling conversion produced empty output.")
-            
-        return markdown
+
+        content = self._download_bytes(
+            url, total_timeout=30.0, max_bytes=25 * 1024 * 1024, stage="Docling URL download"
+        )
+        suffix = os.path.splitext(urlparse(url).path)[1] or ".bin"
+        document_path = None
+        conversion_started = time.perf_counter()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as document_file:
+                document_file.write(content)
+                document_path = document_file.name
+            result = converter.convert(document_path, max_num_pages=100, max_file_size=25 * 1024 * 1024)
+            markdown = result.document.export_to_markdown()
+            if not markdown or not markdown.strip():
+                raise ValueError("Docling conversion produced empty output.")
+            return markdown
+        finally:
+            logger.info(
+                "[RAG-TIME] Docling conversion host=%s: %.3f sec",
+                urlparse(url).hostname or "unknown-host",
+                time.perf_counter() - conversion_started
+            )
+            if document_path and os.path.exists(document_path):
+                os.unlink(document_path)
 
     def load_with_trafilatura(self, url: str) -> tuple[str, str]:
         """
         Fast primary parser that fetches webpage HTML and converts it to Markdown.
         Returns tuple of (markdown_content, method_name).
         """
-        logger.info(f"Attempting Trafilatura download/parse for URL: {url}")
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
-        
-        response = requests.get(url, headers=headers, timeout=self.request_timeout)
-        response.raise_for_status()
-        html_content = response.text
-        
+        logger.info("Attempting Trafilatura download/parse for host=%s", urlparse(url).hostname or "unknown-host")
+        response_bytes = self._download_bytes(
+            url, total_timeout=20.0, max_bytes=10 * 1024 * 1024, stage="website HTTP request"
+        )
+        html_content = response_bytes.decode("utf-8", errors="replace")
+        extraction_started = time.perf_counter()
         markdown = trafilatura.extract(
             html_content,
             output_format="markdown",
@@ -131,6 +181,12 @@ class WebsiteLoader:
                 
         if not markdown or not markdown.strip():
             raise ValueError("Extraction produced empty output.")
+
+        logger.info(
+            "[RAG-TIME] Trafilatura/HTML extraction host=%s: %.3f sec",
+            urlparse(url).hostname or "unknown-host",
+            time.perf_counter() - extraction_started
+        )
             
         return markdown, method
 
@@ -148,7 +204,7 @@ class WebsiteLoader:
         if self.cache_manager:
             cached = self.cache_manager.get_page(url)
             if cached and cached.get("markdown"):
-                logger.info(f"[Cache] Page cache HIT (SQLite) for URL: '{url}'")
+                logger.info("[Cache] Page cache HIT (SQLite) for host=%s", urlparse(url).hostname or "unknown-host")
                 return cached["markdown"], "SQLiteCache"
 
         is_document = url.lower().endswith(('.pdf', '.docx', '.pptx', '.xlsx'))
@@ -160,16 +216,16 @@ class WebsiteLoader:
             try:
                 markdown = self.load_with_docling(url)
                 method = "Docling"
-                logger.info(f"Successfully loaded document '{url}' using Docling.")
+                logger.info("Successfully loaded document from host=%s using Docling.", urlparse(url).hostname or "unknown-host")
             except Exception as de:
-                logger.error(f"Failed to load document '{url}' with Docling: {de}")
-                raise RuntimeError(f"Docling failed on document URL '{url}': {de}") from de
+                logger.error("Docling failed for host=%s (%s).", urlparse(url).hostname or "unknown-host", type(de).__name__)
+                raise RuntimeError("Docling failed to process a document URL.") from de
         else:
             try:
                 markdown, method = self.load_with_trafilatura(url)
-                logger.info(f"Successfully loaded '{url}' using {method}.")
+                logger.info("Successfully loaded host=%s using %s.", urlparse(url).hostname or "unknown-host", method)
             except Exception as te:
-                logger.warning(f"Fast web extraction failed for '{url}': {te}. Skipping URL.")
+                logger.warning("Fast web extraction failed for host=%s (%s). Skipping URL.", urlparse(url).hostname or "unknown-host", type(te).__name__)
                 raise te
 
         # Save to SQLite cache if successful
@@ -181,18 +237,21 @@ class WebsiteLoader:
                     self.cache_manager.save_page(url, markdown, title=domain, domain=domain)
                     logger.debug(f"[Cache] Page saved to SQLite for URL: '{url}'")
                 except Exception as ce:
-                    logger.warning(f"[Cache] Failed to save page to SQLite for '{url}': {ce}")
+                    logger.warning("[Cache] Failed to save page to SQLite for host=%s (%s).", urlparse(url).hostname or "unknown-host", type(ce).__name__)
             return markdown, method
 
         raise RuntimeError(f"Could not load content from '{url}'")
 
     def load_single_worker(self, url: str) -> Dict[str, Any]:
         """Worker thread function to scrape a single webpage with detailed timing."""
-        import time
         start_time = time.perf_counter()
         try:
             content, method = self.load_url(url)
             elapsed = time.perf_counter() - start_time
+            logger.info(
+                "[RAG-TIME] website URL processing host=%s method=%s: %.3f sec",
+                urlparse(url).hostname or "unknown-host", method, elapsed
+            )
             return {
                 "url": url,
                 "content": content,
@@ -203,7 +262,11 @@ class WebsiteLoader:
             }
         except Exception as e:
             elapsed = time.perf_counter() - start_time
-            err_msg = str(e)
+            err_msg = type(e).__name__
+            logger.info(
+                "[RAG-TIME] website URL processing host=%s failed: %.3f sec",
+                urlparse(url).hostname or "unknown-host", elapsed
+            )
             return {
                 "url": url,
                 "content": "",
@@ -222,42 +285,47 @@ class WebsiteLoader:
             return []
 
         max_workers = min(MAX_CONCURRENT_REQUESTS, total)
+        batch_started = time.perf_counter()
         logger.info(f"Starting concurrent loading for {total} URLs with {max_workers} parallel workers.")
         print_loading(f"Fetching and parsing {total} web pages concurrently (workers={max_workers})...")
 
         results_map = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_url = {executor.submit(self.load_single_worker, url): url for url in urls}
-            for future in concurrent.futures.as_completed(future_to_url):
-                url = future_to_url[future]
-                try:
-                    res = future.result(timeout=self.request_timeout + 2.0)
-                    results_map[url] = res
-                except concurrent.futures.TimeoutError:
-                    logger.warning(f"Extraction timed out for URL: '{url}'")
-                    results_map[url] = {
-                        "url": url,
-                        "content": "",
-                        "success": False,
-                        "duration": round(self.request_timeout + 2.0, 3),
-                        "method": "Failed",
-                        "error": "Timeout"
-                    }
-                except Exception as ex:
-                    results_map[url] = {
-                        "url": url,
-                        "content": "",
-                        "success": False,
-                        "duration": 0.0,
-                        "method": "Failed",
-                        "error": str(ex)
-                    }
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        future_to_url = {executor.submit(self.load_single_worker, url): url for url in urls}
+        done, pending = concurrent.futures.wait(future_to_url, timeout=self.total_load_timeout)
+        for future in done:
+            url = future_to_url[future]
+            try:
+                results_map[url] = future.result()
+            except Exception as ex:
+                results_map[url] = {
+                    "url": url,
+                    "content": "",
+                    "success": False,
+                    "duration": 0.0,
+                    "method": "Failed",
+                    "error": type(ex).__name__
+                }
+        for future in pending:
+            url = future_to_url[future]
+            future.cancel()
+            results_map[url] = {
+                "url": url,
+                "content": "",
+                "success": False,
+                "duration": self.total_load_timeout,
+                "method": "Failed",
+                "error": "Timeout"
+            }
+            logger.warning("Website extraction exceeded %.0f-second batch limit (host=%s).", self.total_load_timeout, urlparse(url).hostname or "unknown-host")
+        executor.shutdown(wait=not pending, cancel_futures=True)
 
         success_count = sum(1 for res in results_map.values() if res.get("success"))
         timeout_count = sum(1 for res in results_map.values() if res.get("error") == "Timeout" or "timeout" in str(res.get("error", "")).lower())
         failed_count = len(urls) - success_count - timeout_count
 
         logger.info(f"[EXTRACTION] success={success_count} failed={failed_count} timeout={timeout_count}")
+        logger.info("[RAG-TIME] website loading batch: %.3f sec", time.perf_counter() - batch_started)
 
         ordered_results = []
         for i, url in enumerate(urls, 1):
@@ -265,7 +333,7 @@ class WebsiteLoader:
             if res["success"]:
                 print_success(f"[{i}/{total}] Loaded successfully via {res['method']} ({res['duration']}s, {len(res['content'])} chars): {url[:60]}...")
             else:
-                print_failure(f"[{i}/{total}] Load failed via {res['method']} ({res['duration']}s): {res['error']} for {url[:60]}...")
+                print_failure(f"[{i}/{total}] Load failed via {res['method']} ({res['duration']}s): {res['error']} for {urlparse(url).hostname or 'unknown-host'}")
             ordered_results.append(res)
 
         return ordered_results

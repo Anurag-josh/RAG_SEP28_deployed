@@ -7,6 +7,7 @@ Dependencies: tavily, config.config, config.trusted_sources, utils.logger, utils
 """
 
 import sys
+import time
 from typing import List, Dict, Any
 from tavily import TavilyClient
 from groq import Groq
@@ -52,9 +53,10 @@ class WebSearcher:
         Uses Groq model to rewrite a conversational query into optimized keywords for web search.
         """
         logger.info(f"Optimizing raw query: '{query}'")
+        optimization_started = time.perf_counter()
         try:
             if not hasattr(self, "groq_client"):
-                self.groq_client = Groq(api_key=self.groq_api_key)
+                self.groq_client = Groq(api_key=self.groq_api_key, timeout=30.0, max_retries=0)
             
             prompt = (
                 "You are an expert search engine query optimizer. Your job is to convert the following raw user query "
@@ -73,8 +75,10 @@ class WebSearcher:
             logger.info(f"Optimized query: '{optimized}'")
             return optimized
         except Exception as e:
-            logger.warning(f"Failed to optimize query via Groq: {e}. Using raw query.")
+            logger.warning("Groq query optimization failed (%s); using raw query.", type(e).__name__)
             return query
+        finally:
+            logger.info("[RAG-TIME] Groq query optimization: %.3f sec", time.perf_counter() - optimization_started)
 
     def reformulate_conversational_query(self, query: str, chat_history: List[Dict[str, str]]) -> str:
         """
@@ -84,9 +88,10 @@ class WebSearcher:
             return self.optimize_query(query)
             
         logger.info("Reformulating conversational query based on chat history.")
+        optimization_started = time.perf_counter()
         try:
             if not hasattr(self, "groq_client"):
-                self.groq_client = Groq(api_key=self.groq_api_key)
+                self.groq_client = Groq(api_key=self.groq_api_key, timeout=30.0, max_retries=0)
                 
             history_text = ""
             for msg in chat_history:
@@ -111,8 +116,10 @@ class WebSearcher:
             logger.info(f"Reformulated query: '{reformulated}'")
             return reformulated
         except Exception as e:
-            logger.warning(f"Failed to reformulate query via Groq: {e}. Using raw query.")
+            logger.warning("Groq query reformulation failed (%s); using raw query.", type(e).__name__)
             return query
+        finally:
+            logger.info("[RAG-TIME] Groq query reformulation: %.3f sec", time.perf_counter() - optimization_started)
 
     def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS) -> List[Dict[str, Any]]:
         """
@@ -133,13 +140,14 @@ class WebSearcher:
         logger.info(f"Initiating broad web search for query: '{query}'")
         print_loading("Connecting to Tavily Search API (Broad Web Search)...")
         print_processing(f"Searching broader web for query: '{query}'...")
-        
+        search_started = time.perf_counter()
         try:
             # Execute Tavily Search on the broader web without site: filters
             response = self.client.search(
                 query=query,
                 search_depth="advanced",
-                max_results=max_results
+                max_results=max_results,
+                timeout=20
             )
             
             results = response.get("results", [])
@@ -158,8 +166,10 @@ class WebSearcher:
             return structured_results
 
         except Exception as e:
-            logger.error(f"Unexpected error in web search: {e}")
-            raise RuntimeError(f"Web search failed: {e}") from e
+            logger.error("Tavily search failed (%s).", type(e).__name__)
+            raise RuntimeError("Web search failed.") from e
+        finally:
+            logger.info("[RAG-TIME] Tavily API request: %.3f sec", time.perf_counter() - search_started)
 
 def run_phase1(query: str, max_results: int = 10) -> List[Dict[str, Any]]:
     """

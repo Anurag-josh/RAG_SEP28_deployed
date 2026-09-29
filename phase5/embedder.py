@@ -8,6 +8,7 @@ Dependencies: sentence_transformers, torch, utils.logger, utils.helper
 
 import sys
 import time
+import os
 from typing import List, Dict, Any
 from google import genai
 
@@ -53,8 +54,20 @@ class ChunkEmbedder:
         # Check if local model is in global cache first
         if self.model_name in _LOCAL_MODEL_CACHE:
             self.local_model = _LOCAL_MODEL_CACHE[self.model_name]
+            logger.info("[RAG-TIME] MiniLM initialization skipped; reusing process-local model singleton.")
             logger.debug(f"Reusing cached local SentenceTransformer model: {self.model_name}")
         else:
+            initialization_started = time.perf_counter()
+            logger.info("[RAG-TIME] MiniLM initialization START")
+            os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
+            os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+            try:
+                from huggingface_hub.constants import HF_HUB_CACHE
+                model_cache_path = os.path.join(HF_HUB_CACHE, "models--sentence-transformers--all-MiniLM-L6-v2")
+                cache_state = "hit" if os.path.isdir(model_cache_path) else "miss"
+            except Exception:
+                cache_state = "unknown"
+            logger.info("[RAG-TIME] Hugging Face MiniLM model cache: %s", cache_state)
             print_loading(f"Initializing local SentenceTransformer ('{self.model_name}') model...")
             try:
                 from sentence_transformers import SentenceTransformer
@@ -62,10 +75,19 @@ class ChunkEmbedder:
                 _LOCAL_MODEL_CACHE[self.model_name] = self.local_model
                 logger.info(f"Local SentenceTransformer model ('{self.model_name}') loaded successfully.")
             except Exception as e:
-                logger.warning(f"Could not load local SentenceTransformer: {e}. Trying Gemini API fallback...")
+                logger.warning("Could not load local SentenceTransformer (%s). Trying Gemini API fallback...", type(e).__name__)
                 if self.api_key:
                     self.device = "api"
-                    self.client = genai.Client(api_key=self.api_key)
+                    from google.genai import types
+                    self.client = genai.Client(
+                        api_key=self.api_key,
+                        http_options=types.HttpOptions(timeout=20000)
+                    )
+            finally:
+                logger.info(
+                    "[RAG-TIME] MiniLM initialization END: %.3f sec",
+                    time.perf_counter() - initialization_started
+                )
 
     def get_embedding_dimension(self) -> int:
         """Returns the output vector dimension size dynamically based on model selection."""

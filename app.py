@@ -6,6 +6,7 @@ import atexit
 import sys
 import logging
 import threading
+from functools import wraps
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 
@@ -35,29 +36,48 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32MB max upload
 print("[STARTUP] Flask app created", flush=True)
 
+def log_chat_request_timing(view):
+    @wraps(view)
+    def timed_view(*args, **kwargs):
+        started = time.perf_counter()
+        logger.info("[CHAT] request received")
+        try:
+            return view(*args, **kwargs)
+        finally:
+            logger.info("[CHAT] total request: %.3f sec", time.perf_counter() - started)
+    return timed_view
+
+
 def get_pipeline():
     """Initializes the heavy RAG pipeline once, on the first dependent request."""
     global pipeline
-    if pipeline is not None:
-        return pipeline
-
-    with _pipeline_lock:
+    started = time.perf_counter()
+    logger.info("[RAG-TIME] get_pipeline START")
+    try:
         if pipeline is not None:
             return pipeline
-        try:
-            validate_config()
-            logger.info("[STARTUP] Importing RAG pipeline dependencies on demand.")
-            from phase10.web_grounded_rag import WebGroundedRAGPipeline
 
-            logger.info("[STARTUP] Initializing RAG pipeline on demand.")
-            pipeline = WebGroundedRAGPipeline()
-            if "--clear-cache" in sys.argv:
-                pipeline.cache_manager.clear_all_cache()
-                logger.info("Persistent RAG cache cleared at startup.")
-            logger.info("WebGroundedRAGPipeline successfully initialized.")
-        except Exception:
-            logger.exception("Failed to initialize RAG Pipeline")
-    return pipeline
+        with _pipeline_lock:
+            if pipeline is not None:
+                return pipeline
+            try:
+                validate_config()
+                logger.info("[STARTUP] Importing RAG pipeline dependencies on demand.")
+                from phase10.web_grounded_rag import WebGroundedRAGPipeline
+
+                logger.info("[STARTUP] Initializing RAG pipeline on demand.")
+                initialization_started = time.perf_counter()
+                pipeline = WebGroundedRAGPipeline()
+                logger.info("[RAG-TIME] pipeline initialization: %.3f sec", time.perf_counter() - initialization_started)
+                if "--clear-cache" in sys.argv:
+                    pipeline.cache_manager.clear_all_cache()
+                    logger.info("Persistent RAG cache cleared at startup.")
+                logger.info("WebGroundedRAGPipeline successfully initialized.")
+            except Exception:
+                logger.exception("Failed to initialize RAG Pipeline")
+        return pipeline
+    finally:
+        logger.info("[RAG-TIME] get_pipeline END: %.3f sec", time.perf_counter() - started)
 
 
 def get_auth_mongo():
@@ -314,8 +334,11 @@ def upload_file():
         return jsonify({"success": False, "error": res["error"]}), 400
 
 @app.route("/api/chat", methods=["POST"])
+@log_chat_request_timing
 def chat():
+    pipeline_started = time.perf_counter()
     pipeline_instance = get_pipeline()
+    logger.info("[CHAT] get_pipeline completed: %.3f sec", time.perf_counter() - pipeline_started)
     if not pipeline_instance:
         return jsonify({"success": False, "error": "RAG Pipeline not initialized. Check configuration and Groq API key."}), 500
         
@@ -327,8 +350,10 @@ def chat():
     file_ids = data.get("file_ids", [])
     research_depth = data.get("research_depth", "quick")
     
+    authentication_started = time.perf_counter()
     user_info = get_current_user_info()
     user_id = user_info["user_id"] if user_info else data.get("user_id", "default_user")
+    logger.info("[CHAT] authentication completed: %.3f sec", time.perf_counter() - authentication_started)
 
     logger.info(f"[CHAT] user_id={user_id} chat_id={chat_id}")
 
@@ -351,7 +376,9 @@ def chat():
     augmented_query = context_prefix + message if context_prefix else message
 
     try:
+        run_started = time.perf_counter()
         result = pipeline_instance.run_pipeline(augmented_query, user_id=user_id, chat_id=chat_id, research_depth=research_depth)
+        logger.info("[CHAT] run_pipeline completed: %.3f sec", time.perf_counter() - run_started)
 
         if result.get("success"):
             # Format sources nicely for SourceIQ UI
@@ -423,10 +450,13 @@ def chat():
                     })
                 save_chats(chats)
 
-        return jsonify(result)
+        serialization_started = time.perf_counter()
+        response = jsonify(result)
+        logger.info("[CHAT] response serialization: %.3f sec", time.perf_counter() - serialization_started)
+        return response
     except Exception as e:
-        logger.error(f"Error handling /api/chat query: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.error("[CHAT] request failed (%s)", type(e).__name__)
+        return jsonify({"success": False, "error": "Chat request failed. Please try again."}), 500
 
 @app.route("/api/chats", methods=["GET", "POST"])
 def chats_endpoint():

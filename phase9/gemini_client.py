@@ -156,21 +156,25 @@ class GeminiContentGenerator:
 
         logger.debug("Initializing Groq Client...")
         try:
-            self.groq_client = Groq(api_key=self.groq_api_key)
+            self.groq_client = Groq(api_key=self.groq_api_key, timeout=30.0, max_retries=0)
             self.model_name = self.primary_model
             logger.info(f"Groq primary client initialized with model: {self.primary_model}")
         except Exception as e:
-            logger.error(f"Failed to initialize Groq client: {e}")
-            raise RuntimeError(f"Groq client initialization failed: {e}") from e
+            logger.error("Failed to initialize Groq client (%s).", type(e).__name__)
+            raise RuntimeError("Groq client initialization failed.") from e
 
         self.gemini_client = None
         if self.gemini_key:
             try:
                 from google import genai
-                self.gemini_client = genai.Client(api_key=self.gemini_key)
+                from google.genai import types
+                self.gemini_client = genai.Client(
+                    api_key=self.gemini_key,
+                    http_options=types.HttpOptions(timeout=30000)
+                )
                 logger.info(f"Google Gemini fallback client initialized with model: {self.gemini_model}")
             except Exception as e:
-                logger.warning(f"Google Gemini client initialization skipped/failed: {e}")
+                logger.warning("Google Gemini client initialization skipped/failed (%s).", type(e).__name__)
 
     def _is_daily_tpd_exceeded(self, err_msg: str) -> bool:
         """
@@ -197,6 +201,7 @@ class GeminiContentGenerator:
 
         max_attempts = 2
         for attempt in range(max_attempts):
+            attempt_started = time.perf_counter()
             try:
                 response = self.groq_client.chat.completions.create(
                     model=model,
@@ -243,8 +248,13 @@ class GeminiContentGenerator:
                         logger.warning(f"[GENERATION] Temporary rate limit on Groq '{model}'. Retrying in 2.0s (Attempt {attempt+1}/{max_attempts})...")
                         time.sleep(2.0)
                         continue
-                logger.warning(f"[GENERATION] Groq model '{model}' request failed: {e}")
+                logger.warning("[GENERATION] Groq model request failed (%s).", type(e).__name__)
                 return None, None, "error", False
+            finally:
+                logger.info(
+                    "[RAG-TIME] Groq API attempt model=%s: %.3f sec",
+                    model, time.perf_counter() - attempt_started
+                )
 
         return None, None, "error", False
 
@@ -260,6 +270,7 @@ class GeminiContentGenerator:
             return None, None, "error"
 
         logger.info(f"[GENERATION] Attempting Fallback provider Google Gemini ('{self.gemini_model}')...")
+        generation_started = time.perf_counter()
         try:
             from google.genai import types
             config = types.GenerateContentConfig(
@@ -303,8 +314,10 @@ class GeminiContentGenerator:
             )
             return answer_text, token_dict, finish_reason
         except Exception as e:
-            logger.error(f"[GENERATION] Gemini fallback generation failed: {e}")
+            logger.error("[GENERATION] Gemini fallback generation failed (%s).", type(e).__name__)
             return None, None, "error"
+        finally:
+            logger.info("[RAG-TIME] Gemini API generation: %.3f sec", time.perf_counter() - generation_started)
 
     def _execute_generation_with_fallback(
         self, prompt: str, max_tokens: int
@@ -450,7 +463,7 @@ class GeminiContentGenerator:
                         break
 
                 except Exception as cont_err:
-                    logger.warning(f"[CONTINUATION] pass={current_turn} attempt failed: {cont_err}")
+                    logger.warning("[CONTINUATION] pass=%s attempt failed (%s).", current_turn, type(cont_err).__name__)
                     break
 
                 # Re-evaluate stopping condition

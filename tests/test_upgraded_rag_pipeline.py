@@ -5,7 +5,9 @@ Purpose: Validate broad search, URL validation/deduplication, parallel extractio
 
 import unittest
 import sys
+import time
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 # Add project root to sys.path
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -25,6 +27,36 @@ class TestUpgradedRAGPipeline(unittest.TestCase):
     def setUp(self):
         self.filter_engine = ResultFilter()
         self.loader = WebsiteLoader()
+
+    def test_website_download_uses_bounded_http_timeouts(self):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.iter_content.return_value = [b"test page"]
+
+        with patch("phase3.website_loader.requests.get", return_value=response) as get:
+            content = self.loader._download_bytes(
+                "https://example.com/page", total_timeout=2.0, max_bytes=1024, stage="test download"
+            )
+
+        self.assertEqual(content, b"test page")
+        self.assertEqual(get.call_args.kwargs["timeout"], (3.0, self.loader.request_timeout))
+        self.assertTrue(get.call_args.kwargs["stream"])
+
+    def test_website_batch_returns_at_deadline(self):
+        self.loader.total_load_timeout = 0.02
+
+        def slow_worker(url):
+            time.sleep(0.1)
+            return {"url": url, "content": "", "success": False, "duration": 0.1, "error": "test"}
+
+        started = time.perf_counter()
+        with patch.object(self.loader, "load_single_worker", side_effect=slow_worker):
+            result = self.loader.load_multiple(["https://example.com/slow"])
+
+        self.assertLess(time.perf_counter() - started, 0.08)
+        self.assertFalse(result[0]["success"])
+        self.assertEqual(result[0]["error"], "Timeout")
 
     def test_broad_web_search_and_url_validation(self):
         """Test broad web search (no domain whitelist locks) and URL quality filtering."""
